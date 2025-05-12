@@ -9,6 +9,9 @@ import hashlib
 import uuid
 from argparse import ArgumentParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import re
+import inspect
+import scoring
 
 SALT = "Otus"
 ADMIN_LOGIN = "admin"
@@ -36,44 +39,110 @@ GENDERS = {
 }
 
 
-class CharField(object):
-    pass
+class Field(abc.ABC):
+    def __init__(self, required=False, nullable=True):
+        self.required = required
+        self.nullable = nullable
+
+    @abc.abstractmethod
+    def check_value(self, value): ...
 
 
-class ArgumentsField(object):
-    pass
+class CharField(Field):
+    def check_value(self, value):
+        if not isinstance(value, str):
+            raise ValueError(f'Value must be string: {value}')
+        if not value and not self.nullable:
+            raise ValueError('Value must not be empty')
 
 
-class EmailField(CharField):
-    pass
+class ArgumentsField(Field):
+    def check_value(self, value):
+        pass
 
 
-class PhoneField(object):
-    pass
+class EmailField(Field):
+    def check_value(self, value):
+        if '@' not in value:
+            raise ValueError(f'Email has incorrect format {value}')
 
 
-class DateField(object):
-    pass
+class PhoneField(Field):
+    def check_value(self, value):
+        if not isinstance(value, (int, str)):
+            raise ValueError(f'Invalid type of phone number "{type(value)}", expected string or integer')
+        if not re.match(r'^7\d{10}$', str(value)):
+            raise ValueError(f'Phone number has incorrect format {value}')
 
 
-class BirthDayField(object):
-    pass
+class ParsableDateField(abc.ABC):
+    @staticmethod
+    def parse(value):
+        return datetime.datetime.strptime(value, '%d.%m.%Y')
+
+class DateField(Field, ParsableDateField):
+    def check_value(self, value):
+        self.parse(value)
 
 
-class GenderField(object):
-    pass
+class BirthDayField(Field, ParsableDateField):
+    def check_value(self, value):
+        current = datetime.datetime.now()
+        latest = datetime.datetime(current.year - 70, current.month, current.day)
+        if self.parse(value) < latest:
+            raise ValueError(f'Age is more than 70 years')
 
 
-class ClientIDsField(object):
-    pass
+class GenderField(Field):
+    def check_value(self, value):
+        if value not in [0, 1, 2]:
+            raise ValueError(f'Gender has invalid value: {value}')
 
 
-class ClientsInterestsRequest(object):
+class ClientIDsField(Field):
+    def check_value(self, value):
+        if not isinstance(value, list):
+            raise ValueError(f'Value must be list: {value}')
+        if not value:
+            raise ValueError('Value must not be empty')
+        for client_id in value:
+            if not isinstance(client_id, int):
+                raise ValueError(f'ClientId {client_id} must be integer')
+
+
+class BaseRequest:
+    def __init__(self):
+        self._fields = {}
+        for name, value in inspect.getmembers(self):
+            if isinstance(value, Field):
+                self._fields[name] = value
+
+    def enum_fields(self):
+        for name in self._fields:
+            yield name, getattr(self, name)
+
+    def fill(self, data):
+        for name, field in self._fields.items():
+            if name not in data:
+                if field.required:
+                    raise ValueError(f'Field "{name}" is required')
+                setattr(self, name, ...)
+            else:
+                field.check_value(data[name])
+                setattr(self, name, data[name])
+
+    def not_empty(self, name):
+        value = getattr(self, name)
+        res = value not in ['', [], {}, None]
+        return res
+
+
+class ClientsInterestsRequest(BaseRequest):
     client_ids = ClientIDsField(required=True)
     date = DateField(required=False, nullable=True)
 
 
-class OnlineScoreRequest(object):
+class OnlineScoreRequest(BaseRequest):
     first_name = CharField(required=False, nullable=True)
     last_name = CharField(required=False, nullable=True)
     email = EmailField(required=False, nullable=True)
@@ -81,8 +150,18 @@ class OnlineScoreRequest(object):
     birthday = BirthDayField(required=False, nullable=True)
     gender = GenderField(required=False, nullable=True)
 
+    def fill(self, data):
+        super().fill(data)
+        if ... not in [self.phone, self.email] and self.not_empty('phone') and self.not_empty('email'):
+            return
+        if ... not in [self.first_name, self.last_name] and self.not_empty('first_name') and self.not_empty('last_name'):
+            return
+        if ... not in [self.gender, self.birthday] and self.not_empty('gender') and self.not_empty('birthday'):
+            return
+        raise ValueError(f'Incorrect request: {data}')
 
-class MethodRequest(object):
+
+class MethodRequest(BaseRequest):
     account = CharField(required=False, nullable=True)
     login = CharField(required=True, nullable=True)
     token = CharField(required=True, nullable=True)
@@ -94,6 +173,42 @@ class MethodRequest(object):
         return self.login == ADMIN_LOGIN
 
 
+class RequestHandler(abc.ABC):
+    @abc.abstractmethod
+    def process(self, request, ctx, store): ...
+
+
+class OnlineScoreHandler(RequestHandler):
+    def process(self, request, ctx, store):
+        p = OnlineScoreRequest()
+        p.fill(request.arguments)
+        ctx['has'] = [name for name, value in p.enum_fields() if p.not_empty(name) and value is not Ellipsis]
+        score = 42
+        if not request.is_admin:
+            score = scoring.get_score(store, p.phone, p.email, p.birthday, p.gender, p.first_name, p.last_name)
+        return {'score': score}
+
+
+class ClientInterestHandler(RequestHandler):
+    def process(self, request, ctx, store):
+        p = ClientsInterestsRequest()
+        p.fill(request.arguments)
+        ctx['nclients'] = len(p.client_ids)
+        result = {}
+        for client in p.client_ids:
+            result[client] = scoring.get_interests(store, client)
+        return result
+
+
+def create_request_handler(method):
+    if method == 'online_score':
+        return OnlineScoreHandler()
+    elif method == 'clients_interests':
+        return ClientInterestHandler()
+    else:
+        raise ValueError(f'Unknown method: {method}')
+
+
 def check_auth(request):
     if request.is_admin:
         digest = hashlib.sha512((datetime.datetime.now().strftime("%Y%m%d%H") + ADMIN_SALT).encode('utf-8')).hexdigest()
@@ -103,8 +218,28 @@ def check_auth(request):
 
 
 def method_handler(request, ctx, store):
-    response, code = None, None
-    return response, code
+    r = MethodRequest()
+    try:
+        r.fill(request['body'])
+    except Exception as e:
+        logging.exception(f"Unexpected error: {e}")
+        return ERRORS[INVALID_REQUEST], INVALID_REQUEST
+
+    if not check_auth(r):
+        return ERRORS[FORBIDDEN], FORBIDDEN
+
+    try:
+        handler = create_request_handler(r.method)
+    except ValueError as e:
+        logging.exception(f'Failed to create request handler: {e}')
+        return ERRORS[NOT_FOUND], NOT_FOUND
+
+    try:
+        result = handler.process(r, ctx, store)
+    except Exception as e:
+        logging.exception(f"Unexpected error: {e}")
+        return ERRORS[INVALID_REQUEST], INVALID_REQUEST
+    return result, OK
 
 
 class MainHTTPHandler(BaseHTTPRequestHandler):
